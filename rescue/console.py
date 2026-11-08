@@ -194,12 +194,18 @@ class Console:
     """One drone, one band, one attacker sharing a simulated radio channel.
     At most one packet is in flight at a time (``self.flight``)."""
 
-    def __init__(self, key: bytes = DEMO_KEY, clock=P.slot_of, link=None, realdog=None, tello=None):
+    def __init__(self, key: bytes = DEMO_KEY, clock=P.slot_of, link=None, realdog=None, tello=None,
+                 buzzer=None):
         """``link``: an rescue.radio.SerialLoRaRadio to real hardware. Then every packet
         for the band goes to the ESP32 and its reply is the decision; the in-process
-        Band keeps running as the reference, and any disagreement is flagged."""
+        Band keeps running as the reference, and any disagreement is flagged.
+
+        ``buzzer``: an optional rescue.ble_band.BleBuzzer. When the simulation reaches a
+        verified-friendly band cue, the real wristband buzzes, beeps and blinks over
+        Bluetooth, while its protocol responses stay simulated."""
         self.key, self.clock = key, clock
         self.hw = link
+        self.buzzer = buzzer
         self.hw_band = bool(link and (link.hello or "").startswith("#HELLO band"))  # USB test mode
         # SDR as the drone's radio: the dog's Feather does the near check for real (DOG_CHECK/VERDICT)
         self.hw_sdr = bool(link and (link.hello or "").startswith("#HELLO sdr"))
@@ -377,13 +383,16 @@ class Console:
             return self.view()
         if self.flight.get("proto") == "v2":              # paired periodic check-in chain
             self.flight = None
-            return self._periodic_rx()
-        to, src = self.flight["to"], self.flight.get("src", "drone")
-        self.flight = None
-        v = self._band_rx(src) if to == "band" else self._dog_rx() if to == "dog" else self._drone_rx()
-        if self.flight is None and self.linkup:
-            self._linkup_quiet()                  # channel is quiet: score the stage
-            v["linkup"] = self.linkup_view()
+            v = self._periodic_rx()
+        else:
+            to, src = self.flight["to"], self.flight.get("src", "drone")
+            self.flight = None
+            v = self._band_rx(src) if to == "band" else self._dog_rx() if to == "dog" else self._drone_rx()
+            if self.flight is None and self.linkup:
+                self._linkup_quiet()              # channel is quiet: score the stage
+                v["linkup"] = self.linkup_view()
+        if self.buzzer and v.get("buzz"):         # the simulated band verified: buzz the real one
+            self.buzzer.buzz()
         return v
 
     # ---- receivers -------------------------------------------------------
@@ -1583,6 +1592,10 @@ def main():
                     help="fly a Ryze Tello through the link-up (join its TELLO-XXXXXX Wi-Fi first)")
     ap.add_argument("--band", metavar="ble",
                     help="connect the wristband over Bluetooth: 'ble' (first Rescue-Band found) or 'ble:<name>'")
+    ap.add_argument("--buzz", metavar="ble", nargs="?", const="ble",
+                    help="buzz/beep/blink a real wristband over Bluetooth at each verified-friendly cue, "
+                         "while its responses stay simulated: 'ble' (first Rescue-Band) or 'ble:<name>'. "
+                         "Use this OR --band ble, not both (a band takes one connection at a time)")
     ap.add_argument("--sdr", action="store_true",
                     help="use an SDR as the drone's radio (start sdr/sdr_fsk_bridge.py, or sdr/sdr_bridge.py "
                          "with --link lora, first); the dog's Feather then does the near check for real")
@@ -1616,6 +1629,19 @@ def main():
         from .radio import SerialLoRaRadio
         link = SerialLoRaRadio(args.serial)
         print("Hardware on", args.serial, "->", link.hello or "no boot banner (is the firmware flashed?)")
+    buzzer = None
+    if args.buzz:
+        if args.band:
+            print("Ignoring --buzz: --band ble already owns the wristband's one Bluetooth connection")
+        else:
+            try:
+                from .ble_band import BleBuzzer
+                target = args.buzz[4:] if args.buzz.startswith("ble:") else None
+                buzzer = BleBuzzer(target)
+                print("Buzzer wristband over Bluetooth ->", buzzer.name or buzzer.address)
+            except BaseException as e:
+                print("Could not connect the buzzer wristband:", str(e) or e.__class__.__name__,
+                      "- running without it")
     tello = None
     if args.drone:
         import sys
@@ -1628,7 +1654,7 @@ def main():
             print("Tello not answering (is the Mac on the TELLO-XXXXXX Wi-Fi?) - running without it")
             tello.close()
             tello = None
-    console = Console(link=link, realdog=realdog, tello=tello)
+    console = Console(link=link, realdog=realdog, tello=tello, buzzer=buzzer)
     if dog_error:
         console.dog_error, console.dog_picker_open = dog_error, True
     if band_error:

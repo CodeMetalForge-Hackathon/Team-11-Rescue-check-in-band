@@ -119,3 +119,35 @@ class BleStream:
                 asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop).result(5)
             except Exception:
                 pass
+
+
+class BleBuzzer:
+    """Bluetooth side-channel to a real wristband, used only to make it buzz, beep and blink
+    on cue through the band's built-in '#' test commands (no packets, no crypto, no clock).
+
+    It is independent of BleStream and the band link, so the band's protocol responses can
+    stay simulated while the physical band still reacts at the right moment in the demo.
+    A wristband advertises one connection at a time, so use --buzz OR --band ble, not both.
+    """
+
+    def __init__(self, target=None, scan_s=6.0):
+        self._stream = BleStream(target, scan_s)
+        self.name = self._stream.name
+        self.address = self._stream.address
+
+    def buzz(self, code=True):
+        """Fire the friendly cue on the band and return immediately. ``#C`` plays the
+        3-pulse blink code on the buzzer and LED (the verified-challenge cue); ``#B`` is a
+        plain 0.3 s chirp. Never blocks the caller and never raises: a Bluetooth hiccup must
+        not break the demo."""
+        cmd = b"#C\n" if code else b"#B\n"
+
+        def go():
+            try:
+                self._stream.write(cmd)
+            except Exception:
+                pass
+        threading.Thread(target=go, daemon=True).start()
+
+    def close(self):
+        self._stream.close()
