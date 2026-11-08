@@ -20,7 +20,9 @@ pytestmark = pytest.mark.skipif(CXX is None, reason="no C++ compiler")
 
 def build(src, out):
     subprocess.run([CXX, "-std=c++17", "-O1", "-I", str(FW / "lib/rescue_core"),
-                    str(FW / "lib/rescue_core/rescue_core.cpp"), str(FW / src), "-o", str(out)], check=True)
+                    str(FW / "lib/rescue_core/rescue_core.cpp"),
+                    str(FW / "lib/rescue_core/aes_ccm.cpp"),
+                    str(FW / "lib/rescue_core/vendor/tiny_aes/aes.c"), str(FW / src), "-o", str(out)], check=True)
 
 
 @pytest.fixture(scope="module")
@@ -67,6 +69,22 @@ def test_firmware_core_matches_python_vectors(bins):
     out = subprocess.run([str(bins / "test_core")], capture_output=True, text=True)
     assert out.returncode == 0, out.stdout
     assert "all checks passed" in out.stdout
+
+
+def test_periodic_dog_waits_for_human_and_rejects_stale_replies(tmp_path):
+    exe = tmp_path / "test_periodic_dog"
+    build("test/host/test_periodic_dog.cpp", exe)
+    result = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "periodic dog: ok" in result.stdout
+
+
+def test_checkin_gesture_requires_two_clicks_then_third_hold_and_release(tmp_path):
+    exe = tmp_path / "test_checkin_button"
+    build("test/host/test_checkin_button.cpp", exe)
+    result = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "checkin button: ok" in result.stdout
 
 
 def test_fsk_hop_schedule_meets_the_channel_rules(tmp_path):
@@ -122,3 +140,11 @@ def test_linkup_drift_really_skews_the_board(board):
     _, v = c.act("reset"), None                                          # reset puts the clock back
     v = land_all(c, c.act("challenge"))
     assert v["feed"] == "FRIENDLY"
+
+
+def test_persistent_nonce_counter_handles_reboots_and_torn_writes(tmp_path):
+    exe = tmp_path / "test_nonce_counter"
+    build("test/host/test_nonce_counter.cpp", exe)
+    result = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "nonce counter: ok" in result.stdout

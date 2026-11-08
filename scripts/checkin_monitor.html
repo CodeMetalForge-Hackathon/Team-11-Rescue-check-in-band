@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dog and Wristband Monitor</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif}body{margin:0;background:#101916;color:#e4eee8}main{max-width:1000px;margin:auto;padding:24px}h1{font-size:26px;margin-bottom:8px}p{color:#b0c2b7;line-height:1.6}.box{border:1px solid #395348;border-radius:10px;padding:16px;margin:18px 0;background:#17241e}#connection{font-weight:700}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px 8px;border-bottom:1px solid #395348}th{color:#b0c2b7;font-size:13px}.stale{opacity:.55}.ok{color:#71e2aa}.warn{color:#f4cb75}pre{max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}code{overflow-wrap:anywhere}#error{color:#ffb1a8}.scroll{overflow-x:auto}@media(max-width:600px){main{padding:14px}h1{font-size:22px}td,th{padding:10px 5px;font-size:12px}}
+</style>
+<main><h1>Dog · Wristband</h1><p>The robot and wristband communicate automatically. This laptop displays USB status and sets the dog clock when needed.</p>
+<div class="box" role="status" aria-live="polite"><div id="connection">Waiting for data…</div><div id="readiness"></div><div id="error"></div></div>
+<div class="box scroll"><table><thead><tr><th>Wristband ID</th><th>Status reported by dog</th><th>Next check-in</th></tr></thead><tbody id="peers"></tbody></table><p id="empty">No wristband data yet. Check power, the USB cable and pairing configuration.</p></div>
+<p>Confirmation on the dog does not prove the wristband received the ACK. The two-hour wait does not confirm that the wearer is still nearby. Stale data is marked.</p>
+<details class="box"><summary>USB log</summary><pre id="logs"></pre></details>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const labels={WAITING:'Waiting for response',BAND_SEEN_WAIT_BUTTON:'Band detected · waiting for wearer',CONFIRMED_WAIT_2H:'Confirmed · waiting to check again'};
+function cell(row,text){const td=document.createElement('td');td.textContent=text;row.appendChild(td);return td}
+async function refresh(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error('Unable to read data');const s=await r.json();$('connection').textContent=s.connected?'USB connected':'USB disconnected';$('connection').className=s.connected?'ok':'warn';$('error').textContent=s.error||'';$('readiness').textContent='Radio: '+(s.radio||'unknown')+' · Clock: '+(s.clock==='set'?'synchronized':s.clock==='NOT-set'?'NOT SYNCHRONIZED':'unknown')+' · Encryption: '+(s.encryption||'not reported')+' · Broadcasts: '+(s.nonce_counter==='BLOCKED'?'BLOCKED (nonce storage)':s.interval_seconds===0?'PAUSED':s.clock!=='set'?'waiting for clock':s.interval_seconds==null?'unknown':'every '+s.interval_seconds+'s');$('peers').replaceChildren();$('empty').hidden=s.peers.length>0;for(const p of s.peers){const tr=document.createElement('tr');if(p.stale)tr.className='stale';cell(tr,p.id);cell(tr,(p.state==='WAITING'&&s.interval_seconds===0?'Ready · broadcasting paused':p.state==='WAITING'&&s.clock!=='set'?'Waiting for clock':labels[p.state]||p.state)+(p.stale?' · stale data':''));const n=p.remaining_seconds;cell(tr,p.state!=='CONFIRMED_WAIT_2H'?'—':n===null?'Waiting for countdown from dog':Math.floor(n/3600)+'h '+Math.floor(n%3600/60)+'m '+n%60+'s');$('peers').appendChild(tr)}$('logs').textContent=s.logs.join('\n')}catch(e){$('error').textContent='Unable to connect to the laptop monitor app.'}}
+refresh();setInterval(refresh,1000);
+</script></html>

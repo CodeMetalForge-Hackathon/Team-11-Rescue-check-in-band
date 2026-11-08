@@ -27,7 +27,17 @@
 
 #include "config.h"
 #include "rescue_core.h"
+#include "periodic_link.h"
+#include "checkin_button.h"
 #include "hop.h"
+
+rescue::PeriodicBand* periodic_band = nullptr;
+bool last_was_periodic = false;
+uint64_t pairing_id = 0;
+rescue::CheckinButton checkin_button;
+bool cue_active = false, feather_led_ready = false;
+uint32_t cue_started = 0;
+extern int button_pressed_level;
 #if defined(RADIO_FEATHER)
 #define BAND_FEATHER 1  // radio on a Feather 32u4 RFM69 over Serial1 (firmware/src/feather)
 #endif
@@ -229,6 +239,12 @@ void out(int pin, bool on, bool low_on = false) {
 void led(bool on) {
   out(PIN_LED, on, LOW_ON_LED);
   out(PIN_BUTTON_LED, on);
+#ifdef BAND_FEATHER
+  if (feather_led_ready) {
+    static bool last = true;
+    if (last != on) { Serial1.print(on ? "#L1\n" : "#L0\n"); last = on; }
+  }
+#endif
 }
 
 // The Grove Buzzer v1.3 needs a tone: a steady HIGH only clicks, or beeps unreliably.
@@ -263,9 +279,29 @@ void blink(const uint8_t bits[3]) {
 void handle(const uint8_t* raw, Medium m) {
   if (!clock_set()) Out.println("#WARN clock not set, send #T <unix>");
   uint8_t reply[rescue::PACKET_LEN], bits[3];
-  if (band.on_packet(raw, rescue::PACKET_LEN, now_slot(), reply, bits)) {
+  bool accepted = false;
+  if (raw[0] == rescue::BEACON || raw[0] == rescue::BEACON_ACK) {
+    if (!periodic_band || !clock_set()) return;
+    auto event = periodic_band->on_packet(raw, rescue::PACKET_LEN, now_slot(), millis(), reply, bits);
+    if (event == rescue::PeriodicBand::ACKNOWLEDGED) { Out.println("#CONFIRMED led=5s"); return; }
+    if (event == rescue::PeriodicBand::RETRY_CONFIRMATION) { send(reply, m); return; }
+    accepted = event == rescue::PeriodicBand::PROMPT;
+  } else {
+    // A paired band never downgrades radio traffic to the legacy plaintext mode.
+    if (periodic_band && m == AIR) return;
+    accepted = band.on_packet(raw, rescue::PACKET_LEN, now_slot(), reply, bits);
+  }
+  if (accepted) {
+    last_was_periodic = raw[0] == rescue::BEACON;
     last_medium = m;
     send(reply, m);  // reply first, then the human cue
+    if (last_was_periodic) {
+      checkin_button.arm(digitalRead(PIN_BUTTON) == button_pressed_level);
+      cue_active = true; cue_started = millis();
+      out(PIN_MOTOR, true); buzz(true);
+      Out.println("#PROMPT click-click-hold2s-release");
+      return;
+    }
     Out.printf("#BUZZ %d %d %d\n", bits[0], bits[1], bits[2]);
     if (PIN_MOTOR != NO_PIN) {  // buzzer = "friendly drone here", motor carries the code
       chirp(120);
@@ -277,11 +313,14 @@ void handle(const uint8_t* raw, Medium m) {
   }
 }
 
-void press() {
+void press(bool physical = false) {
+  if (last_was_periodic && !physical) { Out.println("#PRESS use physical gesture"); return; }
   uint8_t alive[rescue::PACKET_LEN];
-  if (band.press(alive)) {
+  bool ready = last_was_periodic ? periodic_band && periodic_band->press(millis(), alive) : band.press(alive);
+  if (ready) {
     send(alive, last_medium, true);
-    Out.println("#PRESS");
+    Out.println(last_was_periodic ? "#PRESS awaiting-dog-ack" : "#PRESS");
+    if (last_was_periodic) return;
     out(PIN_MOTOR, true);  // feel the press go out
     led(true);
     delay(60);
@@ -328,7 +367,7 @@ uint8_t reg(uint8_t addr) {  // read one radio register directly (debug only)
 extern int button_pressed_level;
 extern bool was_down;
 
-void command(const char* line) {
+void command(const char* line, bool local_usb = true) {
   if (line[1] == 'T') {
     double t = atof(line + 2);  // seconds, with milliseconds: the hop schedule needs them
     struct timeval tv = {(time_t)t, (suseconds_t)((t - (double)(time_t)t) * 1e6)};
@@ -340,8 +379,31 @@ void command(const char* line) {
   } else if (line[1] == 'P') {
     press();
   } else if (line[1] == 'L') {
-    led(true); delay(1000); led(false);
+    // Hold each logical LED state so module polarity can be observed by eye.
+    Out.println("#LED_TEST OFF 3s");
+    led(false); Serial.flush(); delay(3000);
+    Out.println("#LED_TEST ON 3s");
+    led(true); Serial.flush(); delay(3000);
+    Out.println("#LED_TEST OFF 3s");
+    led(false); Serial.flush(); delay(3000);
     Out.println("#TEST led done");
+  } else if (line[1] == 'E') {
+    if (PIN_BUTTON_LED == NO_PIN) {
+      Out.println("#LED_TEST disabled: no button LED pin configured");
+      return;
+    }
+    // Bench test: isolate the module LED from gesture/ACK logic for 10 seconds.
+    pinMode(PIN_BUTTON_LED, OUTPUT);
+    digitalWrite(PIN_BUTTON_LED, LOW);
+    Out.printf("#LED_TEST pin=%d LOW 5s button_raw=%d\n", PIN_BUTTON_LED, digitalRead(PIN_BUTTON));
+    Serial.flush();
+    delay(5000);
+    digitalWrite(PIN_BUTTON_LED, HIGH);
+    Out.printf("#LED_TEST pin=%d HIGH 5s button_raw=%d\n", PIN_BUTTON_LED, digitalRead(PIN_BUTTON));
+    Serial.flush();
+    delay(5000);
+    led(false);
+    Out.println("#LED_TEST done");
   } else if (line[1] == 'B') {
     chirp(300);
     Out.printf("#TEST buzzer done (pin %d)\n", PIN_BUZZER);
@@ -458,8 +520,18 @@ void command(const char* line) {
     for (int i = 0; i < n; i++) Out.printf(" %02X", got[i]);
     Out.println();
 #endif
+  } else if (strcmp(line, "#F") == 0) {
+    if (!local_usb || !periodic_band) { Out.println("#ERR clear-wait requires paired band USB"); return; }
+    periodic_band->clear_wait();
+    checkin_button.arm(digitalRead(PIN_BUTTON) == button_pressed_level);
+    cue_active = false; buzz(false); out(PIN_MOTOR, false); led(false);
+    Out.println("#WAIT_CLEARED band");
+  } else if (line[1] == 'I') {
+    Out.printf("#PAIR_ID %08lX%08lX paired=%d\n", (unsigned long)(pairing_id >> 32),
+               (unsigned long)pairing_id, periodic_band ? 1 : 0);
   } else if (line[1] == '?') {
-    Out.printf("#OK band radio=%s\n", radio_ok ? "ok" : "missing");
+    Out.printf("#OK band radio=%s led_pin=%d button_raw=%d pressed_level=%d clear_wait=%d\n",
+               radio_ok ? "ok" : "missing", PIN_BUTTON_LED, digitalRead(PIN_BUTTON), button_pressed_level, periodic_band ? 1 : 0);
   }
 }
 
@@ -501,6 +573,15 @@ bool was_down = false;  // button state, reset after the probe commands  // lear
 
 void setup() {
   Serial.begin(115200);
+  // Use all 48 factory MAC bits, represented as a 16-digit ID. Never a BLE name.
+  pairing_id = ESP.getEfuseMac();
+#if defined(PERIODIC_PAIR_KEY_BYTES) && defined(PERIODIC_DOG_ID)
+  static const uint8_t pair_key[rescue::KEY_LEN] = PERIODIC_PAIR_KEY_BYTES;
+  static rescue::PeriodicBand paired(pair_key, PERIODIC_DOG_ID, pairing_id);
+  periodic_band = &paired;
+#endif
+  Out.printf("#PAIR_ID %08lX%08lX paired=%d\n", (unsigned long)(pairing_id >> 32),
+             (unsigned long)pairing_id, periodic_band ? 1 : 0);
   pinMode(PIN_LED, OUTPUT);
   if (PIN_BUTTON_LED != NO_PIN) pinMode(PIN_BUTTON_LED, OUTPUT);
   led(false);
@@ -512,9 +593,12 @@ void setup() {
   pinMode(PIN_BUTTON, BUTTON_MODULE ? INPUT : INPUT_PULLUP);
   delay(20);
   button_pressed_level = digitalRead(PIN_BUTTON) == HIGH ? LOW : HIGH;  // don't hold it at power-on
+  checkin_button.begin(digitalRead(PIN_BUTTON) == button_pressed_level, millis());
 
 #ifdef BAND_FEATHER
   Serial1.begin(FEATHER_LINK_BAUD, SERIAL_8N1, PIN_FEATHER_RX, PIN_FEATHER_TX);
+  feather_led_ready = true;
+  led(false);
 #else
   SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_CS);
 #endif
@@ -549,10 +633,7 @@ void setup() {
   Out.printf("#PINS sck=%d miso=%d mosi=%d cs=%d rst=%d dio0=%d led=%d button=%d(pressed=%s) buzzer=%d motor=%d\n",
                 PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_DIO0, PIN_LED,
                 PIN_BUTTON, button_pressed_level == HIGH ? "HIGH" : "LOW", PIN_BUZZER, PIN_MOTOR);
-  led(true);  // power-on: flash, short chirp so you know the buzzer works
-  chirp(40);
-  delay(40);
-  led(false);
+  led(false);  // status LED is off until a button press or verified success
 }
 
 void loop() {
@@ -573,7 +654,7 @@ void loop() {
   while (xQueueReceive(ble_in, &ch, 0) == pdTRUE) {
     auto ev = ble_parser.feed((uint8_t)ch);
     if (ev == rescue::FrameParser::PACKET) handle(ble_parser.packet(), USB_LINK);
-    else if (ev == rescue::FrameParser::LINE) command(ble_parser.line());
+    else if (ev == rescue::FrameParser::LINE) command(ble_parser.line(), false);
   }
   if (ble_connected && !ble_out.empty()) {      // notify in 20-byte chunks (works at any MTU)
     std::string chunk;
@@ -601,12 +682,22 @@ void loop() {
   }
 #endif
 
-  static uint32_t last_change = 0;
-  bool down = digitalRead(PIN_BUTTON) == button_pressed_level;
-  if (down != was_down && millis() - last_change > 40) {
-    last_change = millis();
+  uint32_t now = millis();
+  if (cue_active && (uint32_t)(now - cue_started) >= 120) {
+    cue_active = false; out(PIN_MOTOR, false); buzz(false);
+  }
+  bool enabled = periodic_band && last_was_periodic && periodic_band->waiting(now);
+  bool gesture = checkin_button.update(digitalRead(PIN_BUTTON) == button_pressed_level, now, enabled);
+  bool down = checkin_button.pressed();
+  if (down != was_down) {
     was_down = down;
     Out.println(down ? "#BTN down" : "#BTN up");
-    if (down) press();
+    if (down && !last_was_periodic && !periodic_band) press(true);
+  }
+  if (gesture) press(true);
+  if (periodic_band) {
+    uint8_t retry[rescue::PACKET_LEN];
+    if (periodic_band->retry_confirmation(now, retry)) send(retry, last_medium, true);
+    led(periodic_band->status_led(now));
   }
 }
