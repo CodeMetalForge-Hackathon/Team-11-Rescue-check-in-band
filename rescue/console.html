@@ -402,6 +402,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="pgroup">
     <button class="pbtn" id="pChallenge" title="Drone challenges the band once">CHALLENGE</button>
     <button class="pbtn" id="pAlive" title="Wearer presses I'M ALIVE on the band">ALIVE</button>
+    <button class="pbtn" id="pPeriodic" title="Dog runs a v2 paired periodic check-in (AES-128-CCM beacon, reply, gesture, ACK)">CHECK-IN v2</button>
     <button class="pbtn threat" id="pSpoof" title="Attacker sends a challenge signed with the wrong key">SPOOF</button>
     <button class="pbtn threat" id="pReplay" title="Attacker replays a captured reply">REPLAY</button>
     <button class="pbtn" id="pReset">RESET</button>
@@ -469,9 +470,11 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
       <div style="color:var(--soft)" id="caption">No verified exchange</div>
     </div>
     <button class="big" id="btnChallenge" style="border:2px solid var(--green);background:#14301C;color:var(--green)">CHALLENGE</button>
+    <button class="big" id="btnPeriodic" style="border:2px solid var(--violet,#B18CFF);background:#241E33;color:var(--violet,#B18CFF)" title="v2 paired periodic check-in: AES-128-CCM beacon, reply, gesture, ACK">PERIODIC CHECK-IN (v2)</button>
     <div style="display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:12px">
       <div class="kv"><span>OUTSTANDING NONCE</span><span id="outNonce">none</span></div>
       <div class="kv"><span>VERIFIED EXCHANGES</span><span id="exchanges">0</span></div>
+      <div class="kv"><span>CHECK-IN v2</span><span style="color:var(--text-hi);font-weight:700" id="periodicStatus">idle</span></div>
       <div class="kv"><span>HOUR BLINK CODE</span><span style="display:flex;gap:6px" id="codeBoxes"></span></div>
     </div>
   </section>
@@ -812,6 +815,11 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     $('exchanges').textContent = s.exchanges;
     $('rejects').textContent = s.rejects;
     $('bandStatus').textContent = s.bandStatus;
+    if (s.periodic) {
+      let pt = s.periodic.status;
+      if (s.periodic.cooling && s.periodic.remaining_s) pt += ' (' + Math.ceil(s.periodic.remaining_s / 60) + ' min left)';
+      const pel = $('periodicStatus'); if (pel) pel.textContent = pt;
+    }
     $('codeBoxes').innerHTML = s.blink.map((b) => `<span class="box">${b ? 'L' : 'S'}</span>`).join('');
     renderPulses();
     renderInsp(s.insp);
@@ -1211,6 +1219,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     replay: ['ATTACKER', 'The attacker re-sends the genuine reply it recorded earlier'],
     press: ['BAND', "The wearer presses I'M ALIVE on the band"],
     incoming: ['BAND', 'The BOOT button was pressed on the real band'],
+    periodic_checkin: ['DOG', 'Paired periodic check-in: the dog sends an encrypted AES-128-CCM beacon and waits for the wearer'],
   };
 
   async function run(action) {
@@ -1398,6 +1407,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   });
 
   $('btnChallenge').onclick = () => run('challenge');
+  $('btnPeriodic').onclick = () => run('periodic_checkin');
   $('btnSpoof').onclick = () => run('spoof');
   $('btnReplay').onclick = () => run('replay');
   $('btnAlive').onclick = () => run('press');
@@ -1473,6 +1483,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     document.querySelectorAll('#scnList .scn').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.v === scenario)));
   };
   $('pChallenge').onclick = () => run('challenge');
+  $('pPeriodic').onclick = () => run('periodic_checkin');
   $('pSpoof').onclick = () => run('spoof');
   $('pReplay').onclick = () => run('replay');
   $('pAlive').onclick = () => run('press');

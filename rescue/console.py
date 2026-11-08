@@ -22,6 +22,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import periodic as PP
 from . import protocol as P
 from .band import Band
 from .interrogator import Interrogator
@@ -30,6 +31,11 @@ from .radio import LoopbackRadio
 DEMO_KEY = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")  # same demo key as the tests
 ATTACKER_KEY = bytes.fromhex("deadbeef" * 4)
 NAMES = {P.CHALLENGE: "CHALLENGE", P.REPLY: "AUTO REPLY", P.ALIVE: "ALIVE"}
+# Demo identities for the v2 paired periodic check-in (rescue/periodic.py). Real deployments
+# provision a random per-pair key per dog/band; here the console signs with DEMO_KEY so the
+# simulated dog and band pair up out of the box.
+DEMO_DOG_ID = 0xD0000000000001
+DEMO_BAND_ID = 0xB0000000000001
 HTML = Path(__file__).with_name("console.html")
 
 
@@ -144,6 +150,22 @@ def insp(title, route, raw, checks):
     return {"title": title, "route": route, "raw": raw.hex(), "fields": fields(raw), "checks": checks}
 
 
+def pfields(raw: bytes):
+    """Split a v2 periodic beacon into its wire fields (TAG and IDs are encrypted)."""
+    return [
+        {"name": "TYPE", "hex": raw[0:1].hex()},
+        {"name": "VER", "hex": raw[1:2].hex()},
+        {"name": "COUNTER", "hex": raw[2:6].hex()},
+        {"name": "SLOT16", "hex": raw[6:8].hex()},
+        {"name": "TAG8", "hex": raw[8:16].hex()},
+        {"name": "ENC_IDS", "hex": raw[16:32].hex()},
+    ]
+
+
+def pinsp(title, route, raw, checks):
+    return {"title": title, "route": route, "raw": raw.hex(), "fields": pfields(raw), "checks": checks}
+
+
 def full_hmac(key, ptype, nonce, slot):
     """The untruncated HMAC, only to show the truncation step. Same input as P.tag."""
     return hmac.new(key, bytes([ptype]) + nonce + struct.pack(">I", slot), hashlib.sha256).digest()
@@ -217,6 +239,13 @@ class Console:
         self.flight = None          # packet in the air: who, to, label, build steps
         self.exchanges = self.rejects = 0
         self.band_status = "LISTENING (wake-on-radio)"
+        # v2 paired periodic check-in (rescue/periodic.py): a simulated dog and band pair.
+        self.pdog = PP.PeriodicDog(self.key, DEMO_DOG_ID, DEMO_BAND_ID)
+        self.pband = PP.PeriodicBand(self.key, DEMO_DOG_ID, DEMO_BAND_ID)
+        self.periodic_status = "idle"
+        self._p_inflight = None     # the v2 packet currently in the air
+        self._p_now = 0             # ms clock shared across one check-in's steps
+        self._p_slot = 0
         self.last_reject = None
         self.insp = {"title": "No packet yet", "route": "Press CHALLENGE to start the exchange.",
                      "raw": "", "fields": [], "checks": []}
@@ -346,6 +375,9 @@ class Console:
         and ``buzz`` bits if the band verified."""
         if not self._busy():
             return self.view()
+        if self.flight.get("proto") == "v2":              # paired periodic check-in chain
+            self.flight = None
+            return self._periodic_rx()
         to, src = self.flight["to"], self.flight.get("src", "drone")
         self.flight = None
         v = self._band_rx(src) if to == "band" else self._dog_rx() if to == "dog" else self._drone_rx()
@@ -561,6 +593,167 @@ class Console:
             step("Button", "BOOT button pressed on the ESP32", "pressed"),
             step("Sign", "%s with the last verified nonce" % name, pkt.mac.hex()),
             step("Transmit", "back the way the last challenge came", "sent")])
+        return self.view()
+
+    # ---- v2 paired periodic check-in -------------------------------------
+    #
+    # The dog sends an encrypted, authenticated BEACON; the band prompts the wearer and
+    # answers with a BEACON_REPLY (radio is alive) and, after the gesture, a BEACON_ALIVE;
+    # the dog confirms with a BEACON_ACK and skips the band for two hours. Simulated over
+    # the loopback radio by default (rescue/periodic.py), or transmitted over real hardware
+    # with --serial. All four signals are AES-128-CCM (types 6/7/8/9).
+
+    def _p_build(self, title, counter, ptype_name):
+        return [
+            step("Type", "v2 periodic %s (type %s)" % (ptype_name, {"BEACON": 6, "BEACON REPLY": 7,
+                 "BEACON ALIVE": 8, "BEACON ACK": 9}.get(ptype_name, "?")), ptype_name),
+            step("Counter", "monotonic uniqueness counter (never reused)", counter.hex()),
+            step("Slot", "UTC hour = unix time // 3600", "%d (SLOT16 %04x)" % (self._p_slot, self._p_slot & 0xFFFF)),
+            step("Derive key", "HMAC-SHA256(pair key, \"RESCUE-CCM-v2\" | dog | band)[:16]", "per-pair AES-128 key"),
+            step("AES-128-CCM", "encrypt dog+band IDs, authenticate the clear header", "8-byte tag"),
+            step("Frame", "TYPE VER COUNTER SLOT16 TAG8 ENC_IDS", "32 bytes"),
+            step("Transmit", LINK["band"] + ", " + AIRTIME, "on air"),
+        ]
+
+    def periodic_checkin(self):
+        """Start a v2 paired periodic check-in. Over real hardware this transmits the
+        BEACON on the wire; otherwise it runs the full simulated exchange."""
+        if self._busy():
+            return self.view()
+        if self.hw and not self.hw_band and not self.hw_sdr:
+            return self._periodic_hw_send()      # a radio dongle: actually transmit
+        # Fresh pair each run so the demo button always completes (real dogs keep a 2 h cooldown).
+        self.pdog = PP.PeriodicDog(self.key, DEMO_DOG_ID, DEMO_BAND_ID)
+        self.pband = PP.PeriodicBand(self.key, DEMO_DOG_ID, DEMO_BAND_ID)
+        self._p_now = int(time.time() * 1000)
+        self._p_slot = self.clock()
+        beacon = self.pdog.challenge(self._p_now, self._p_slot)
+        if beacon is None:                       # cooling down (shouldn't happen on a fresh pair)
+            self.periodic_status = "cooling down (2 h)"
+            return self.view()
+        self._p_inflight = beacon
+        self.periodic_status = "BEACON sent, waiting for the band"
+        counter = beacon[2:6]
+        self._log("DOG", "TX BEACON (v2) counter %s band %016X" % (counter.hex(), DEMO_BAND_ID))
+        self.insp = pinsp("BEACON (v2)", "Dog to band, AES-128-CCM, IDs encrypted", beacon, [
+            {"label": "encrypted", "value": "dog + band IDs, 8-byte CCM tag", "tone": "info"},
+            {"label": "clear", "value": "TYPE VER COUNTER SLOT16 (authenticated)", "tone": "warn"}])
+        self._launch("BEACON", "DOG", "band", self._p_build("BEACON", counter, "BEACON"), src="dog")
+        self.flight["proto"] = "v2"
+        return self.view()
+
+    def _periodic_rx(self):
+        """Deliver one v2 packet and advance the dog<->band state machines, chaining the
+        next signal via ``inspNext`` until the exchange completes."""
+        raw = self._p_inflight
+        self._p_inflight = None
+        now, slot = self._p_now, self._p_slot
+        v = self.view()
+        ptype = raw[0] if raw else 0
+
+        if ptype == PP.BEACON:                   # lands at the band
+            event, reply, bits = self.pband.on_packet(raw, now, slot)
+            if event != PP.PROMPT or reply is None:
+                self.periodic_status = "band silent (bad beacon)"
+                v["trace"] = {"who": "BAND", "label": "ignored the beacon", "ok": False, "verdict": "SILENT",
+                              "steps": [step("Verify", "AES-CCM tag or pair ID did not match", "no match", "bad")]}
+                return v
+            self.pdog.receive(reply, now, slot)  # BEACON_REPLY -> the dog sees the band's radio
+            self.periodic_status = "band prompting wearer (buzzing)"
+            self._log("BAND", "BEACON verified: buzz + blink, TX BEACON REPLY (radio alive)")
+            v["trace"] = {"who": "BAND", "label": "verified the beacon", "ok": True, "verdict": "PROMPT",
+                          "steps": [step("Decrypt", "AES-128-CCM opens the IDs", "dog+band match"),
+                                    step("Prompt", "buzz the wearer, blink this hour's code", "cue"),
+                                    step("Reply", "TX BEACON REPLY: the radio is alive", "sent")]}
+            v["buzz"] = bits
+            self._p_inflight = reply
+            self.insp = pinsp("BEACON REPLY (v2)", "Band to dog, radio is alive", reply, [
+                {"label": "means", "value": "radio answered; wearer has NOT confirmed yet", "tone": "warn"}])
+            self._launch("BAND REPLY", "BAND", "dog", self._p_build("BEACON REPLY", reply[2:6], "BEACON REPLY"))
+            self.flight["proto"] = "v2"
+            v["inspNext"] = self.insp
+            v["flight"] = self.flight
+            return v
+
+        if ptype == PP.BEACON_REPLY:             # lands at the dog; now simulate the wearer gesture
+            alive = self.pband.press(now)
+            self.periodic_status = "wearer completed the gesture"
+            self._log("BAND", "Wearer gesture (double-click, long-press): TX BEACON ALIVE")
+            v["trace"] = {"who": "DOG", "label": "band seen", "ok": True, "verdict": "BAND SEEN",
+                          "steps": [step("Verify", "BEACON REPLY tag matches the outstanding nonce", "ok"),
+                                    step("Wait", "radio alive; still need the wearer's confirmation", "gesture")]}
+            if alive is None:
+                self.periodic_status = "gesture window expired"
+                return v
+            self._p_inflight = alive
+            self.insp = pinsp("BEACON ALIVE (v2)", "Band to dog, wearer confirmed", alive, [
+                {"label": "means", "value": "the wearer physically confirmed", "tone": "alive"}])
+            self._launch("BAND ALIVE", "BAND", "dog", self._p_build("BEACON ALIVE", alive[2:6], "BEACON ALIVE"))
+            self.flight["proto"] = "v2"
+            v["inspNext"] = self.insp
+            v["flight"] = self.flight
+            return v
+
+        if ptype == PP.BEACON_ALIVE:             # lands at the dog; it confirms and ACKs
+            self.pdog.receive(raw, now, slot)
+            ack = self.pdog.receipt(raw, now, slot)
+            self.periodic_status = "dog confirmed, sending ACK"
+            self._log("DOG", "BEACON ALIVE verified: PERSON CONFIRMED, TX BEACON ACK, cooldown 2 h")
+            v["trace"] = {"who": "DOG", "label": "person confirmed", "ok": True, "verdict": "CONFIRMED",
+                          "steps": [step("Decrypt", "AES-128-CCM opens the IDs", "match"),
+                                    step("Confirm", "the wearer is accounted for", "PERSON CONFIRMED"),
+                                    step("ACK", "TX BEACON ACK; skip this band for 2 h", "sent")]}
+            if ack is None:
+                return v
+            self._p_inflight = ack
+            self.insp = pinsp("BEACON ACK (v2)", "Dog to band, encrypted acknowledgement", ack, [
+                {"label": "effect", "value": "band shows success LED 5 s, cooldown 2 h", "tone": "alive"}])
+            self._launch("BAND ACK", "DOG", "band", self._p_build("BEACON ACK", ack[2:6], "BEACON ACK"), src="dog")
+            self.flight["proto"] = "v2"
+            v["inspNext"] = self.insp
+            v["flight"] = self.flight
+            return v
+
+        if ptype == PP.BEACON_ACK:               # lands at the band; check-in complete
+            event, _, _ = self.pband.on_packet(raw, now, slot)
+            if event == PP.ACKNOWLEDGED:
+                self.periodic_status = "CONFIRMED (success LED 5 s, cooldown 2 h)"
+                self._log("BAND", "BEACON ACK verified: #CONFIRMED led=5s", "info")
+                v["trace"] = {"who": "BAND", "label": "acknowledged", "ok": True, "verdict": "CONFIRMED",
+                              "steps": [step("Decrypt", "AES-128-CCM opens the ACK", "match"),
+                                        step("Done", "light the success LED for 5 s", "led=5s"),
+                                        step("Cooldown", "suppress prompts for 2 h", "2 h")]}
+            else:
+                self.periodic_status = "ACK not accepted"
+                v["trace"] = {"who": "BAND", "label": "ignored the ACK", "ok": False, "verdict": "SILENT",
+                              "steps": [step("Verify", "ACK did not match the outstanding confirmation", "no match", "bad")]}
+            return v
+
+        return v
+
+    def _periodic_hw_send(self):
+        """Real hardware (a radio dongle): actually transmit a v2 BEACON on the wire.
+        A real paired band only answers with its own provisioned key and a physical
+        gesture, so we transmit honestly and report whatever comes back."""
+        self._p_now = int(time.time() * 1000)
+        self._p_slot = self.clock()
+        self.pdog = PP.PeriodicDog(self.key, DEMO_DOG_ID, DEMO_BAND_ID)
+        beacon = self.pdog.challenge(self._p_now, self._p_slot)
+        self._stash_unsolicited()
+        self.hw.clear()
+        self.hw.send(beacon)
+        self._log("DOG", "TX BEACON (v2) on %s, counter %s" % (self.hw.port, beacon[2:6].hex()))
+        reply = self.hw.recv(2.0)
+        if reply is not None and PP.verify_beacon(self.key, reply, PP.BEACON_REPLY, self._p_slot,
+                                                  DEMO_DOG_ID, DEMO_BAND_ID) is not None:
+            self.periodic_status = "BEACON REPLY received over the air"
+            self._log("BAND", "RX BEACON REPLY over the air: radio alive", "info")
+        else:
+            self.periodic_status = "BEACON sent; no matching reply"
+            self._log("HW", "No matching BEACON REPLY. A real paired band needs its own "
+                      "provisioned key and the physical gesture.", "warn")
+        self.insp = pinsp("BEACON (v2)", "Dog to band over %s, AES-128-CCM" % self.hw.port, beacon, [
+            {"label": "encrypted", "value": "dog + band IDs, 8-byte CCM tag", "tone": "info"}])
         return self.view()
 
     def _lost(self, raw):
@@ -988,6 +1181,9 @@ class Console:
             "blink": P.blink_bits(self.key, slot),
             "canAlive": self._can_alive(), "replayReady": self.captured is not None,
             "bandStatus": self.band_status, "insp": self.insp,
+            "periodic": {"status": self.periodic_status,
+                         "cooling": self.pdog.cooling(int(time.time() * 1000)),
+                         "remaining_s": self.pdog.remaining_seconds(int(time.time() * 1000))},
             "log": list(reversed(self.log)),
             "linkup": self.linkup_view() if self.linkup else None,
             "hw": {"port": self.hw.port, "hello": self.hw.hello or "no banner",
@@ -1115,7 +1311,7 @@ class Console:
             self.realdog = None
             return self.view()
 
-    FREE_PLAY = ("challenge", "spoof", "replay", "press", "incoming")
+    FREE_PLAY = ("challenge", "spoof", "replay", "press", "incoming", "periodic_checkin")
     ACTIONS = FREE_PLAY + ("deliver", "reset", "linkup_start", "linkup_far", "linkup_alive", "linkup_near",
                            "linkup_countersign", "linkup_complete", "dog_walk")
 
